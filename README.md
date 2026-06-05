@@ -85,7 +85,7 @@ auto_commit_checkpoint({
 })
 ```
 
-The inputs describe intent in plain language. The extension generates the actual git commit message from those inputs plus bounded git status, stats, and diff excerpts.
+The inputs describe intent in plain language. The extension generates the actual git commit message from those inputs plus bounded git status, stats, diff excerpts, and untracked-file excerpts.
 
 Because Pi can run sibling tool calls in parallel, `auto_commit_checkpoint` must be the only tool call in its assistant turn. If the agent combines it with other tools, the extension blocks the checkpoint and the agent should retry after those tools finish.
 

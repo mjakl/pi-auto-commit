@@ -1,4 +1,4 @@
-import { access, readFile } from "node:fs/promises";
+import { access, open, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { completeSimple, type Api, type AssistantMessage, type Model, type UserMessage } from "@earendil-works/pi-ai";
@@ -6,6 +6,9 @@ import { getAgentDir, type ExecResult, type ExtensionAPI, type ExtensionContext 
 import { Type } from "typebox";
 
 const CONFIG_PATH = join(getAgentDir(), "extensions", "pi-auto-commit.json");
+const MAX_UNTRACKED_FILES = 20;
+const MAX_UNTRACKED_FILE_BYTES = 4000;
+const MAX_UNTRACKED_TOTAL_BYTES = 20000;
 
 const DEFAULT_MESSAGE_INSTRUCTIONS = [
 	"Keep commit messages short.",
@@ -65,11 +68,12 @@ type GitContext = {
 	stagedStat: string;
 	unstagedDiff: string;
 	stagedDiff: string;
+	untrackedFiles: string;
 };
 
 type SelectedCommitModel = {
 	model: Model<Api>;
-	apiKey: string;
+	apiKey?: string;
 	headers?: Record<string, string>;
 	reasoning?: ReasoningLevel;
 };
@@ -184,6 +188,10 @@ async function getPorcelainStatus(pi: ExtensionAPI, ctx: ExtensionContext, signa
 	return gitStdout(pi, ctx, ["status", "--porcelain=v1", "-z"], 5000, signal);
 }
 
+async function getRepoRoot(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<string> {
+	return (await gitStdout(pi, ctx, ["rev-parse", "--show-toplevel"], 5000, signal)).trim();
+}
+
 async function checkActivation(pi: ExtensionAPI, ctx: ExtensionContext): Promise<ActivationResult> {
 	if (!(await isInsideGitRepo(pi, ctx))) {
 		return { ok: false, reason: "Auto-commit can only be enabled inside a git repository." };
@@ -259,16 +267,60 @@ function clip(text: string, maxChars = 12000): string {
 	return `${text.slice(0, maxChars)}\n...[truncated]`;
 }
 
+async function readUntrackedExcerpt(path: string, maxBytes: number): Promise<string> {
+	const file = await open(path, "r");
+	try {
+		const buffer = Buffer.alloc(maxBytes + 1);
+		const { bytesRead } = await file.read(buffer, 0, maxBytes + 1, 0);
+		const bytes = buffer.subarray(0, Math.min(bytesRead, maxBytes));
+		if (bytes.includes(0)) return "[binary file skipped]";
+
+		const suffix = bytesRead > maxBytes ? "\n...[truncated]" : "";
+		return bytes.toString("utf8") + suffix;
+	} finally {
+		await file.close();
+	}
+}
+
+async function collectUntrackedFiles(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<string> {
+	const raw = await gitStdout(pi, ctx, ["ls-files", "--others", "--exclude-standard", "--full-name", "-z"], 10000, signal);
+	const paths = raw.split("\0").filter(Boolean);
+	if (paths.length === 0) return "";
+
+	const repoRoot = await getRepoRoot(pi, ctx, signal);
+	let remainingBytes = MAX_UNTRACKED_TOTAL_BYTES;
+	const excerpts: string[] = [];
+
+	for (const relativePath of paths.slice(0, MAX_UNTRACKED_FILES)) {
+		if (remainingBytes <= 0) break;
+
+		try {
+			const excerpt = await readUntrackedExcerpt(resolve(repoRoot, relativePath), Math.min(MAX_UNTRACKED_FILE_BYTES, remainingBytes));
+			remainingBytes -= excerpt.length;
+			excerpts.push(`# ${relativePath}\n${excerpt}`);
+		} catch (error) {
+			excerpts.push(`# ${relativePath}\n[unreadable: ${errorText(error)}]`);
+		}
+	}
+
+	if (paths.length > MAX_UNTRACKED_FILES) {
+		excerpts.push(`...[${paths.length - MAX_UNTRACKED_FILES} more untracked file(s) omitted]`);
+	}
+
+	return excerpts.join("\n\n");
+}
+
 async function collectGitContext(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<GitContext> {
-	const [statusShort, unstagedStat, stagedStat, unstagedDiff, stagedDiff] = await Promise.all([
+	const [statusShort, unstagedStat, stagedStat, unstagedDiff, stagedDiff, untrackedFiles] = await Promise.all([
 		gitStdout(pi, ctx, ["status", "--short"], 5000, signal),
 		gitStdout(pi, ctx, ["diff", "--stat"], 10000, signal),
 		gitStdout(pi, ctx, ["diff", "--cached", "--stat"], 10000, signal),
 		gitStdout(pi, ctx, ["diff", "--no-ext-diff", "--no-color"], 15000, signal),
 		gitStdout(pi, ctx, ["diff", "--cached", "--no-ext-diff", "--no-color"], 15000, signal),
+		collectUntrackedFiles(pi, ctx, signal),
 	]);
 
-	return { statusShort, unstagedStat, stagedStat, unstagedDiff, stagedDiff };
+	return { statusShort, unstagedStat, stagedStat, unstagedDiff, stagedDiff, untrackedFiles };
 }
 
 function extractText(message: AssistantMessage): string {
@@ -338,6 +390,9 @@ ${clip(gitContext.unstagedDiff)}
 
 # git diff --cached
 ${clip(gitContext.stagedDiff)}
+
+# untracked file excerpts
+${clip(gitContext.untrackedFiles)}
 `;
 }
 
@@ -360,8 +415,9 @@ async function selectCommitModel(
 	}
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !auth.apiKey) {
-		throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
+	if (!auth.ok) throw new Error(auth.error);
+	if (!auth.apiKey && !auth.headers) {
+		throw new Error(`No API key or auth headers for ${model.provider}`);
 	}
 
 	const thinking = config.commitModel?.thinking ?? pi.getThinkingLevel();

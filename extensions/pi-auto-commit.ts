@@ -1,8 +1,8 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
-import { completeSimple, type AssistantMessage, type Model, type UserMessage } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { completeSimple, type Api, type AssistantMessage, type Model, type UserMessage } from "@earendil-works/pi-ai";
+import { getAgentDir, type ExecResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const CONFIG_PATH = join(getAgentDir(), "extensions", "pi-auto-commit.json");
@@ -15,10 +15,38 @@ const DEFAULT_MESSAGE_INSTRUCTIONS = [
 	"Write a body only when it adds useful context beyond the subject.",
 ];
 
+const ENABLED_PROMPT = `Auto-commit is enabled.
+
+When you complete a coherent, git-visible change, call \`auto_commit_checkpoint\`
+with:
+- \`change_summary\`: what changed
+- \`change_reason\`: why it changed, if non-obvious
+
+Call the checkpoint before asking the user for more input if the current
+git-visible changes are coherent and ready to commit.
+
+Do not run \`git add\` or \`git commit\` yourself unless the user explicitly asks
+you to use the normal git workflow.
+
+Anything git-visible may be committed. Put scratch or non-deliverable files in
+\`/tmp\`, a \`mktemp -d\` directory, or a git-ignored path. If a visible change
+should not be committed, move it out of git visibility or ask the user.`;
+
+const DISABLED_PROMPT = `Auto-commit is disabled.
+
+Do not call \`auto_commit_checkpoint\`. If the user explicitly asks you to commit,
+use the normal git workflow. Otherwise leave changes uncommitted.`;
+
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+type ReasoningLevel = Exclude<ThinkingLevel, "off">;
 
-type CommitModelConfig = { provider: string; model: string; thinking: ThinkingLevel };
+type CommitModelConfig = {
+	provider: string;
+	model: string;
+	thinking: ThinkingLevel;
+};
+
 type AutoCommitConfig = {
 	defaultEnabled: boolean;
 	commitModel?: CommitModelConfig;
@@ -27,26 +55,53 @@ type AutoCommitConfig = {
 };
 
 type ActivationResult = { ok: true } | { ok: false; reason: string };
-
 type CommitMessage = { subject: string; body?: string };
+type GitContext = {
+	statusShort: string;
+	unstagedStat: string;
+	stagedStat: string;
+	unstagedDiff: string;
+	stagedDiff: string;
+};
+
+type SelectedCommitModel = {
+	model: Model<Api>;
+	apiKey: string;
+	headers?: Record<string, string>;
+	reasoning?: ReasoningLevel;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
 	return typeof value === "string" && THINKING_LEVELS.includes(value as ThinkingLevel);
 }
 
+function reasoningFromThinking(thinking: ThinkingLevel): ReasoningLevel | undefined {
+	return thinking === "off" ? undefined : thinking;
+}
+
 function normalizeInstructions(value: unknown): string[] {
 	if (!Array.isArray(value)) return DEFAULT_MESSAGE_INSTRUCTIONS;
-	const items = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
-	return items.length > 0 ? items : DEFAULT_MESSAGE_INSTRUCTIONS;
+
+	const instructions = value
+		.filter((item): item is string => typeof item === "string")
+		.map((item) => item.trim())
+		.filter(Boolean);
+
+	return instructions.length > 0 ? instructions : DEFAULT_MESSAGE_INSTRUCTIONS;
 }
 
 function parseCommitModel(value: unknown): Pick<AutoCommitConfig, "commitModel" | "commitModelError"> {
 	if (value === undefined) return {};
 	if (!isRecord(value)) return { commitModelError: "Invalid commitModel config: expected an object." };
+
 	if (typeof value.provider !== "string" || value.provider.trim() === "") {
 		return { commitModelError: "Invalid commitModel config: provider is required." };
 	}
@@ -54,10 +109,18 @@ function parseCommitModel(value: unknown): Pick<AutoCommitConfig, "commitModel" 
 		return { commitModelError: "Invalid commitModel config: model is required." };
 	}
 	if (!isThinkingLevel(value.thinking)) {
-		return { commitModelError: "Invalid commitModel config: thinking must be off, minimal, low, medium, high, or xhigh." };
+		return {
+			commitModelError:
+				"Invalid commitModel config: thinking must be off, minimal, low, medium, high, or xhigh.",
+		};
 	}
+
 	return {
-		commitModel: { provider: value.provider.trim(), model: value.model.trim(), thinking: value.thinking },
+		commitModel: {
+			provider: value.provider.trim(),
+			model: value.model.trim(),
+			thinking: value.thinking,
+		},
 	};
 }
 
@@ -72,178 +135,337 @@ function parseConfig(raw: unknown): AutoCommitConfig {
 
 async function loadConfig(ctx: ExtensionContext): Promise<AutoCommitConfig> {
 	try {
-		return parseConfig(JSON.parse(await readFile(CONFIG_PATH, "utf8")));
+		const text = await readFile(CONFIG_PATH, "utf8");
+		return parseConfig(JSON.parse(text));
 	} catch (error) {
 		if (isRecord(error) && error.code === "ENOENT") return parseConfig({});
-		ctx.ui.notify(`Could not load pi-auto-commit config; using defaults. ${String(error)}`, "warning");
+
+		ctx.ui.notify(`Could not load pi-auto-commit config; using defaults. ${errorText(error)}`, "warning");
 		return parseConfig({});
 	}
 }
 
-async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]) {
-	return pi.exec("git", args, { cwd: ctx.cwd, timeout: 15000 });
+async function execGit(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	args: string[],
+	timeout = 15000,
+): Promise<ExecResult> {
+	return pi.exec("git", args, { cwd: ctx.cwd, timeout, signal: ctx.signal });
+}
+
+function gitFailure(command: string, result: ExecResult): Error {
+	const output = (result.stderr || result.stdout).trim();
+	return new Error(output ? `${command} failed: ${output}` : `${command} failed with exit code ${result.code}.`);
+}
+
+async function gitStdout(pi: ExtensionAPI, ctx: ExtensionContext, args: string[], timeout?: number): Promise<string> {
+	const result = await execGit(pi, ctx, args, timeout);
+	if (result.code !== 0) throw gitFailure(`git ${args.join(" ")}`, result);
+	return result.stdout;
 }
 
 async function isInsideGitRepo(pi: ExtensionAPI, ctx: ExtensionContext): Promise<boolean> {
-	const result = await execGit(pi, ctx, ["rev-parse", "--is-inside-work-tree"]);
+	const result = await execGit(pi, ctx, ["rev-parse", "--is-inside-work-tree"], 5000);
 	return result.code === 0 && result.stdout.trim() === "true";
 }
 
-async function getDirtyStatus(pi: ExtensionAPI, ctx: ExtensionContext) {
-	const result = await execGit(pi, ctx, ["status", "--porcelain=v1", "-z"]);
-	return result.code === 0 ? result.stdout : null;
+async function getPorcelainStatus(pi: ExtensionAPI, ctx: ExtensionContext): Promise<string> {
+	return gitStdout(pi, ctx, ["status", "--porcelain=v1", "-z"], 5000);
 }
 
 async function checkActivation(pi: ExtensionAPI, ctx: ExtensionContext): Promise<ActivationResult> {
 	if (!(await isInsideGitRepo(pi, ctx))) {
 		return { ok: false, reason: "Auto-commit can only be enabled inside a git repository." };
 	}
-	const status = await getDirtyStatus(pi, ctx);
-	if (status === null) {
-		return { ok: false, reason: "Could not inspect git status." };
+
+	let status: string;
+	try {
+		status = await getPorcelainStatus(pi, ctx);
+	} catch (error) {
+		return { ok: false, reason: `Could not inspect git status: ${errorText(error)}` };
 	}
+
 	if (status.length > 0) {
 		return {
 			ok: false,
 			reason: "Auto-commit requires a clean git-visible worktree. Commit, clean, stash, or ignore files manually first.",
 		};
 	}
+
 	return { ok: true };
 }
 
-function parsePorcelainEntries(zSeparated: string): string[] {
-	return zSeparated.split("\0").map((s) => s.trim()).filter(Boolean);
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await access(path);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
-function clip(text: string, max = 5000) {
-	return text.length <= max ? text : `${text.slice(0, max)}\n...[truncated]`;
+async function gitPath(pi: ExtensionAPI, ctx: ExtensionContext, path: string): Promise<string> {
+	const raw = (await gitStdout(pi, ctx, ["rev-parse", "--git-path", path], 5000)).trim();
+	return resolve(ctx.cwd, raw);
 }
 
-function extractText(msg: AssistantMessage): string {
-	return msg.content
-		.filter((b) => b.type === "text")
-		.map((b) => b.text)
+async function getInProgressGitState(pi: ExtensionAPI, ctx: ExtensionContext): Promise<string[]> {
+	const markers = [
+		"MERGE_HEAD",
+		"CHERRY_PICK_HEAD",
+		"REVERT_HEAD",
+		"REBASE_HEAD",
+		"rebase-merge",
+		"rebase-apply",
+		"sequencer",
+	];
+	const present: string[] = [];
+
+	for (const marker of markers) {
+		if (await pathExists(await gitPath(pi, ctx, marker))) {
+			present.push(marker);
+		}
+	}
+
+	return present;
+}
+
+function clip(text: string, maxChars = 12000): string {
+	if (text.length <= maxChars) return text;
+	return `${text.slice(0, maxChars)}\n...[truncated]`;
+}
+
+async function collectGitContext(pi: ExtensionAPI, ctx: ExtensionContext): Promise<GitContext> {
+	const [statusShort, unstagedStat, stagedStat, unstagedDiff, stagedDiff] = await Promise.all([
+		gitStdout(pi, ctx, ["status", "--short"], 5000),
+		gitStdout(pi, ctx, ["diff", "--stat"], 10000),
+		gitStdout(pi, ctx, ["diff", "--cached", "--stat"], 10000),
+		gitStdout(pi, ctx, ["diff", "--no-ext-diff", "--no-color"], 15000),
+		gitStdout(pi, ctx, ["diff", "--cached", "--no-ext-diff", "--no-color"], 15000),
+	]);
+
+	return { statusShort, unstagedStat, stagedStat, unstagedDiff, stagedDiff };
+}
+
+function extractText(message: AssistantMessage): string {
+	return message.content
+		.filter((block): block is { type: "text"; text: string } => block.type === "text")
+		.map((block) => block.text)
 		.join("\n")
 		.trim();
 }
 
-function parseJsonCommit(text: string): CommitMessage {
-	const data = JSON.parse(text) as unknown;
-	if (!isRecord(data) || typeof data.subject !== "string" || data.subject.trim() === "") {
-		throw new Error(`Invalid commit message JSON: ${clip(text)}`);
+function parseCommitMessageJson(text: string): CommitMessage | undefined {
+	try {
+		const data = JSON.parse(text) as unknown;
+		if (!isRecord(data)) return undefined;
+		if (typeof data.subject !== "string" || data.subject.trim() === "") return undefined;
+		if (data.body !== undefined && typeof data.body !== "string") return undefined;
+
+		const body = typeof data.body === "string" && data.body.trim() !== "" ? data.body.trim() : undefined;
+		return { subject: data.subject.trim(), body };
+	} catch {
+		return undefined;
 	}
-	const body = typeof data.body === "string" && data.body.trim() ? data.body.trim() : undefined;
-	return { subject: data.subject.trim(), body };
 }
 
-async function generateCommitMessage(pi: ExtensionAPI, ctx: ExtensionContext, config: AutoCommitConfig, changeSummary: string, changeReason?: string): Promise<CommitMessage> {
+function buildCommitMessagePrompt(config: AutoCommitConfig, gitContext: GitContext, changeSummary: string, changeReason?: string): string {
+	return `You write git commit messages for a Pi auto-commit extension.
+
+Follow these instructions:
+${config.messageInstructions.map((instruction) => `- ${instruction}`).join("\n")}
+
+Return strict JSON only, with this shape:
+{
+  "subject": "Add auto-commit checkpoint flow",
+  "body": "Keeps commit handling in the extension while the main agent only marks coherent change boundaries."
+}
+
+Use an empty body string when a body would not add useful context.
+
+Agent-provided intent:
+change_summary: ${changeSummary}
+${changeReason ? `change_reason: ${changeReason}\n` : ""}
+Git context:
+
+# git status --short
+${clip(gitContext.statusShort)}
+
+# git diff --stat
+${clip(gitContext.unstagedStat)}
+
+# git diff --cached --stat
+${clip(gitContext.stagedStat)}
+
+# git diff
+${clip(gitContext.unstagedDiff)}
+
+# git diff --cached
+${clip(gitContext.stagedDiff)}
+`;
+}
+
+async function selectCommitModel(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	config: AutoCommitConfig,
+): Promise<SelectedCommitModel> {
 	if (config.commitModelError) throw new Error(config.commitModelError);
+
 	const model = config.commitModel
 		? ctx.modelRegistry.find(config.commitModel.provider, config.commitModel.model)
 		: ctx.model;
-	if (!model) throw new Error(config.commitModel ? `Commit model not found: ${config.commitModel.provider}/${config.commitModel.model}` : "No active model selected.");
+	if (!model) {
+		throw new Error(
+			config.commitModel
+				? `Commit model not found: ${config.commitModel.provider}/${config.commitModel.model}`
+				: "No active model selected for commit-message generation.",
+		);
+	}
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok || !auth.apiKey) {
 		throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
 	}
 
-	const status = await execGit(pi, ctx, ["status", "--short"]);
-	const statUnstaged = await execGit(pi, ctx, ["diff", "--stat"]);
-	const statStaged = await execGit(pi, ctx, ["diff", "--cached", "--stat"]);
-	const diffUnstaged = await execGit(pi, ctx, ["diff", "--no-ext-diff", "--no-color"]);
-	const diffStaged = await execGit(pi, ctx, ["diff", "--cached", "--no-ext-diff", "--no-color"]);
-
-	const prompt = [
-		...config.messageInstructions.map((line) => `- ${line}`),
-		"Return strict JSON only in this shape: {\"subject\":string,\"body\"?:string}",
-		`change_summary: ${changeSummary}`,
-		changeReason ? `change_reason: ${changeReason}` : undefined,
-		`git status --short:\n${clip(status.stdout)}`,
-		`git diff --stat:\n${clip(statUnstaged.stdout)}`,
-		`git diff --cached --stat:\n${clip(statStaged.stdout)}`,
-		`git diff:\n${clip(diffUnstaged.stdout)}`,
-		`git diff --cached:\n${clip(diffStaged.stdout)}`,
-	].filter(Boolean).join("\n\n");
-
-	const response = await completeSimple(model as Model, {
-		systemPrompt: prompt,
-		messages: [{ role: "user", content: [{ type: "text", text: "Generate the commit message now." }], timestamp: Date.now() } satisfies UserMessage],
-	}, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal, reasoning });
-
-	let message = parseJsonCommit(extractText(response));
-	if (message.subject && message.subject.length > 0) return message;
-	throw new Error("Commit message model did not return usable JSON.");
+	const thinking = config.commitModel?.thinking ?? pi.getThinkingLevel();
+	return {
+		model,
+		apiKey: auth.apiKey,
+		headers: auth.headers,
+		reasoning: reasoningFromThinking(thinking),
+	};
 }
 
-async function repairCommitMessage(pi: ExtensionAPI, ctx: ExtensionContext, model: Model, auth: { apiKey: string; headers?: Record<string, string> }, previous: string): Promise<CommitMessage> {
-	const repair = await completeSimple(model, {
-		systemPrompt: "Convert the previous output into strict JSON with keys subject and optional body only.",
-		messages: [{ role: "user", content: [{ type: "text", text: previous }], timestamp: Date.now() } satisfies UserMessage],
-	}, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal, reasoning });
-	return parseJsonCommit(extractText(repair));
-}
+async function callCommitMessageModel(
+	ctx: ExtensionContext,
+	selection: SelectedCommitModel,
+	systemPrompt: string,
+	userText: string,
+): Promise<string> {
+	const userMessage: UserMessage = {
+		role: "user",
+		content: [{ type: "text", text: userText }],
+		timestamp: Date.now(),
+	};
 
-async function getCommitMessage(pi: ExtensionAPI, ctx: ExtensionContext, config: AutoCommitConfig, changeSummary: string, changeReason?: string): Promise<CommitMessage> {
-	const model = config.commitModel ? ctx.modelRegistry.find(config.commitModel.provider, config.commitModel.model) : ctx.model;
-	if (!model) throw new Error(config.commitModel ? `Commit model not found: ${config.commitModel.provider}/${config.commitModel.model}` : "No active model selected.");
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !auth.apiKey) throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
-	try {
-		return await generateCommitMessage(pi, ctx, config, changeSummary, changeReason);
-	} catch (error) {
-		const previous = error instanceof Error ? error.message : String(error);
-		try {
-			return await repairCommitMessage(pi, ctx, model, { apiKey: auth.apiKey, headers: auth.headers }, previous);
-		} catch {
-			throw new Error("Commit message model output was invalid.");
-		}
+	const response = await completeSimple(
+		selection.model,
+		{ systemPrompt, messages: [userMessage] },
+		{
+			apiKey: selection.apiKey,
+			headers: selection.headers,
+			signal: ctx.signal,
+			reasoning: selection.reasoning,
+		},
+	);
+
+	if (response.stopReason === "aborted") {
+		throw new Error("Commit-message generation was cancelled.");
 	}
+
+	return extractText(response);
 }
 
-async function checkpoint(pi: ExtensionAPI, ctx: ExtensionContext, config: AutoCommitConfig, changeSummary: string, changeReason?: string) {
-	if (!enabledState.enabled) throw new Error("Auto-commit is disabled. This tool cannot commit. If the user explicitly asked for a commit, use the normal git workflow instead.");
+async function generateCommitMessage(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	config: AutoCommitConfig,
+	gitContext: GitContext,
+	changeSummary: string,
+	changeReason?: string,
+): Promise<CommitMessage> {
+	const selection = await selectCommitModel(pi, ctx, config);
+	const prompt = buildCommitMessagePrompt(config, gitContext, changeSummary, changeReason);
+	const initialOutput = await callCommitMessageModel(ctx, selection, prompt, "Generate the commit message JSON now.");
+	const initialMessage = parseCommitMessageJson(initialOutput);
+	if (initialMessage) return initialMessage;
+
+	const repairOutput = await callCommitMessageModel(
+		ctx,
+		selection,
+		"Convert the user's previous output into strict JSON with only string keys subject and body. Return JSON only.",
+		initialOutput,
+	);
+	const repairedMessage = parseCommitMessageJson(repairOutput);
+	if (repairedMessage) return repairedMessage;
+
+	throw new Error("Commit message model output was invalid after one repair attempt.");
+}
+
+async function commitCheckpoint(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	config: AutoCommitConfig,
+	changeSummary: string,
+	changeReason?: string,
+) {
 	if (!(await isInsideGitRepo(pi, ctx))) throw new Error("Not inside a git repository.");
-	if (await hasInProgressGitState(pi, ctx)) throw new Error("Git is mid-merge/rebase/cherry-pick. Finish or abort it first.");
-	const dirty = await getDirtyStatus(pi, ctx);
-	if (dirty === null) throw new Error("Could not inspect git status.");
-	if (dirty.length === 0) return { content: [{ type: "text", text: "No git-visible changes to commit." }] };
 
-	const commitMessage = await getCommitMessage(pi, ctx, config, changeSummary, changeReason);
-	await execGit(pi, ctx, ["add", "-A"]);
-	const check = await execGit(pi, ctx, ["diff", "--cached", "--check"]);
-	if (check.code !== 0) throw new Error(check.stderr || check.stdout || "git diff --cached --check failed.");
-	const commitArgs = ["commit", "-m", commitMessage.subject];
-	if (commitMessage.body) commitArgs.push("-m", commitMessage.body);
-	const committed = await execGit(pi, ctx, commitArgs);
-	if (committed.code !== 0) throw new Error(committed.stderr || committed.stdout || "git commit failed.");
-	const hash = (await execGit(pi, ctx, ["rev-parse", "--short", "HEAD"])).stdout.trim();
-	return { content: [{ type: "text", text: `${hash} ${commitMessage.subject}` }] };
+	const inProgress = await getInProgressGitState(pi, ctx);
+	if (inProgress.length > 0) {
+		throw new Error(`Git operation in progress (${inProgress.join(", ")}). Finish or abort it before checkpointing.`);
+	}
+
+	const status = await getPorcelainStatus(pi, ctx);
+	if (status.length === 0) {
+		return {
+			content: [{ type: "text" as const, text: "No git-visible changes to commit." }],
+			details: { committed: false, reason: "clean" },
+		};
+	}
+
+	const gitContext = await collectGitContext(pi, ctx);
+	const message = await generateCommitMessage(pi, ctx, config, gitContext, changeSummary, changeReason);
+
+	await gitStdout(pi, ctx, ["add", "-A"]);
+
+	const diffCheck = await execGit(pi, ctx, ["diff", "--cached", "--check"], 15000);
+	if (diffCheck.code !== 0) throw gitFailure("git diff --cached --check", diffCheck);
+
+	const commitArgs = ["commit", "-m", message.subject];
+	if (message.body) commitArgs.push("-m", message.body);
+
+	const commit = await execGit(pi, ctx, commitArgs, 30000);
+	if (commit.code !== 0) throw gitFailure("git commit", commit);
+
+	const hash = (await gitStdout(pi, ctx, ["rev-parse", "--short", "HEAD"], 5000)).trim();
+	return {
+		content: [{ type: "text" as const, text: `${hash} ${message.subject}` }],
+		details: { committed: true, hash, subject: message.subject },
+	};
 }
-
-const enabledState = { enabled: false };
 
 export default function piAutoCommit(pi: ExtensionAPI) {
 	let config: AutoCommitConfig = parseConfig({});
+	let enabled = false;
 
 	function setEnabled(ctx: ExtensionContext, next: boolean) {
-		enabledState.enabled = next;
+		enabled = next;
 		ctx.ui.setStatus("autocommit", next ? "autocommit" : undefined);
 	}
 
 	pi.registerCommand("autocommit", {
 		description: "Toggle auto-commit for this session",
-		handler: async (_args, ctx) => {
-			if (enabledState.enabled) {
+		handler: async (args, ctx) => {
+			if (args.trim() !== "") {
+				ctx.ui.notify("Usage: /autocommit", "error");
+				return;
+			}
+
+			if (enabled) {
 				setEnabled(ctx, false);
 				ctx.ui.notify("Auto-commit disabled.", "info");
 				return;
 			}
+
 			const activation = await checkActivation(pi, ctx);
 			if (!activation.ok) {
 				ctx.ui.notify(activation.reason, "error");
 				return;
 			}
+
 			setEnabled(ctx, true);
 			ctx.ui.notify("Auto-commit enabled.", "info");
 		},
@@ -252,33 +474,39 @@ export default function piAutoCommit(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "auto_commit_checkpoint",
 		label: "Auto Commit Checkpoint",
-		description: "Commit a coherent git-visible change checkpoint.",
+		description: "Commit all current git-visible changes at a coherent checkpoint when auto-commit is enabled.",
 		parameters: Type.Object({
-			change_summary: Type.String(),
-			change_reason: Type.Optional(Type.String()),
+			change_summary: Type.String({ description: "What changed, in plain language." }),
+			change_reason: Type.Optional(Type.String({ description: "Why it changed or important design context." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return checkpoint(pi, ctx, config, params.change_summary, params.change_reason);
+			if (!enabled) {
+				throw new Error(
+					"Auto-commit is disabled. This tool cannot commit.\nIf the user explicitly asked for a commit, use the normal git workflow instead.",
+				);
+			}
+
+			return commitCheckpoint(pi, ctx, config, params.change_summary, params.change_reason);
 		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = await loadConfig(ctx);
 		setEnabled(ctx, false);
+
 		if (!config.defaultEnabled) return;
+
 		const activation = await checkActivation(pi, ctx);
 		if (!activation.ok) {
 			ctx.ui.notify(activation.reason, "warning");
 			return;
 		}
+
 		setEnabled(ctx, true);
+		ctx.ui.notify("Auto-commit enabled.", "info");
 	});
 
-	pi.on("before_agent_start", async (_event, ctx) => {
-		return {
-			systemPrompt: enabledState.enabled
-				? `${ctx.getSystemPrompt()}\n\nAuto-commit is enabled. When you complete a coherent, git-visible change, call auto_commit_checkpoint before asking the user for more input.`
-				: `${ctx.getSystemPrompt()}\n\nAuto-commit is disabled. Do not call auto_commit_checkpoint unless the user explicitly asks for the normal git workflow.`,
-		};
-	});
+	pi.on("before_agent_start", async (event) => ({
+		systemPrompt: `${event.systemPrompt}\n\n${enabled ? ENABLED_PROMPT : DISABLED_PROMPT}`,
+	}));
 }

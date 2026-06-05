@@ -11,6 +11,10 @@
     "README.md",
     "extensions"
   ],
+  "scripts": {
+    "validate": "npm run validate:load",
+    "validate:load": "pi -e . --list-models >/dev/null 2>&1"
+  },
   "pi": {
     "extensions": [
       "./extensions"

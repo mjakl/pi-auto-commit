@@ -91,17 +91,24 @@ Commit-message generation hard-errors without staging or committing if the confi
 
 ## Validation
 
-Quick manual checks:
+Lightweight load check:
 
-- Load locally with `pi -e .`.
-- Not in a git repo: startup and `/autocommit` fail clearly.
-- Clean git repo: `/autocommit` enables and shows `autocommit`.
-- Dirty git-visible repo: `/autocommit` rejects enablement.
-- Ignored files do not block enablement.
-- With `defaultEnabled: true`, startup tries to enable and warns if it cannot.
-- Disabled `auto_commit_checkpoint` returns the generic git-workflow error.
-- Successful checkpoint commits staged, unstaged, untracked, and deleted git-visible changes.
-- No git-visible changes returns a compact no-op.
-- Invalid/unavailable commit model hard-errors with no staging.
-- Malformed model output gets one repair attempt, then hard-errors if still invalid.
-- `git diff --cached --check` / hook failures surface and auto-commit stays enabled.
+```bash
+npm run validate
+```
+
+Manual validation matrix:
+
+- Package loads from a local path with `pi -e .` or after `pi install /path/to/pi-auto-commit`.
+- Not in a git repo: startup with `defaultEnabled: true` and manual `/autocommit` emit errors and stay disabled.
+- Clean git repo: `/autocommit` enables, status shows `autocommit`, and the next agent turn receives the enabled policy.
+- Dirty git-visible repo: `/autocommit` rejects enablement; `defaultEnabled: true` startup warns and stays disabled.
+- Ignored files do not block enablement and are not committed.
+- Disabled `auto_commit_checkpoint` returns the generic git-workflow error without mentioning local skills or subagents.
+- Successful checkpoint commits all git-visible changes, including staged, unstaged, untracked, and deleted files, and returns hash plus subject.
+- No git-visible changes returns a compact no-op without calling the model.
+- Invalid/unavailable configured commit model hard-errors with no staging or commit.
+- Missing current model/auth when no `commitModel` is configured hard-errors with no staging or commit.
+- Malformed model output gets exactly one repair attempt, then hard-errors if still invalid.
+- `git diff --cached --check` and commit hook failures are surfaced; auto-commit remains enabled.
+- `/autocommit` off works even with a dirty worktree and does not stage, commit, stash, or clean.

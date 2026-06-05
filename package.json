@@ -1,0 +1,24 @@
+{
+  "name": "pi-auto-commit",
+  "version": "0.1.0",
+  "description": "Pi extension for agent-triggered, extension-owned git commit checkpoints.",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "files": [
+    "README.md",
+    "extensions"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

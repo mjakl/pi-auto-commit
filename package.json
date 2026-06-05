@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "validate": "npm run validate:load",
-    "validate:load": "pi -e . --list-models >/dev/null 2>&1"
+    "validate:load": "pi -e . --list-models >/tmp/pi-auto-commit-validate.log 2>&1 || (cat /tmp/pi-auto-commit-validate.log && exit 1)"
   },
   "pi": {
     "extensions": [

@@ -25,6 +25,9 @@ with:
 Call the checkpoint before asking the user for more input if the current
 git-visible changes are coherent and ready to commit.
 
+Call \`auto_commit_checkpoint\` as the only tool call in that assistant turn;
+finish file and shell tool calls first.
+
 Do not run \`git add\` or \`git commit\` yourself unless the user explicitly asks
 you to use the normal git workflow.
 
@@ -150,8 +153,9 @@ async function execGit(
 	ctx: ExtensionContext,
 	args: string[],
 	timeout = 15000,
+	signal?: AbortSignal,
 ): Promise<ExecResult> {
-	return pi.exec("git", args, { cwd: ctx.cwd, timeout, signal: ctx.signal });
+	return pi.exec("git", args, { cwd: ctx.cwd, timeout, signal: signal ?? ctx.signal });
 }
 
 function gitFailure(command: string, result: ExecResult): Error {
@@ -159,24 +163,43 @@ function gitFailure(command: string, result: ExecResult): Error {
 	return new Error(output ? `${command} failed: ${output}` : `${command} failed with exit code ${result.code}.`);
 }
 
-async function gitStdout(pi: ExtensionAPI, ctx: ExtensionContext, args: string[], timeout?: number): Promise<string> {
-	const result = await execGit(pi, ctx, args, timeout);
+async function gitStdout(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	args: string[],
+	timeout?: number,
+	signal?: AbortSignal,
+): Promise<string> {
+	const result = await execGit(pi, ctx, args, timeout, signal);
 	if (result.code !== 0) throw gitFailure(`git ${args.join(" ")}`, result);
 	return result.stdout;
 }
 
-async function isInsideGitRepo(pi: ExtensionAPI, ctx: ExtensionContext): Promise<boolean> {
-	const result = await execGit(pi, ctx, ["rev-parse", "--is-inside-work-tree"], 5000);
+async function isInsideGitRepo(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<boolean> {
+	const result = await execGit(pi, ctx, ["rev-parse", "--is-inside-work-tree"], 5000, signal);
 	return result.code === 0 && result.stdout.trim() === "true";
 }
 
-async function getPorcelainStatus(pi: ExtensionAPI, ctx: ExtensionContext): Promise<string> {
-	return gitStdout(pi, ctx, ["status", "--porcelain=v1", "-z"], 5000);
+async function getPorcelainStatus(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<string> {
+	return gitStdout(pi, ctx, ["status", "--porcelain=v1", "-z"], 5000, signal);
 }
 
 async function checkActivation(pi: ExtensionAPI, ctx: ExtensionContext): Promise<ActivationResult> {
 	if (!(await isInsideGitRepo(pi, ctx))) {
 		return { ok: false, reason: "Auto-commit can only be enabled inside a git repository." };
+	}
+
+	let inProgress: string[];
+	try {
+		inProgress = await getInProgressGitState(pi, ctx);
+	} catch (error) {
+		return { ok: false, reason: `Could not inspect git state: ${errorText(error)}` };
+	}
+	if (inProgress.length > 0) {
+		return {
+			ok: false,
+			reason: `Auto-commit cannot be enabled while git has an operation in progress (${inProgress.join(", ")}). Finish or abort it first.`,
+		};
 	}
 
 	let status: string;
@@ -205,12 +228,12 @@ async function pathExists(path: string): Promise<boolean> {
 	}
 }
 
-async function gitPath(pi: ExtensionAPI, ctx: ExtensionContext, path: string): Promise<string> {
-	const raw = (await gitStdout(pi, ctx, ["rev-parse", "--git-path", path], 5000)).trim();
+async function gitPath(pi: ExtensionAPI, ctx: ExtensionContext, path: string, signal?: AbortSignal): Promise<string> {
+	const raw = (await gitStdout(pi, ctx, ["rev-parse", "--git-path", path], 5000, signal)).trim();
 	return resolve(ctx.cwd, raw);
 }
 
-async function getInProgressGitState(pi: ExtensionAPI, ctx: ExtensionContext): Promise<string[]> {
+async function getInProgressGitState(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<string[]> {
 	const markers = [
 		"MERGE_HEAD",
 		"CHERRY_PICK_HEAD",
@@ -223,7 +246,7 @@ async function getInProgressGitState(pi: ExtensionAPI, ctx: ExtensionContext): P
 	const present: string[] = [];
 
 	for (const marker of markers) {
-		if (await pathExists(await gitPath(pi, ctx, marker))) {
+		if (await pathExists(await gitPath(pi, ctx, marker, signal))) {
 			present.push(marker);
 		}
 	}
@@ -236,13 +259,13 @@ function clip(text: string, maxChars = 12000): string {
 	return `${text.slice(0, maxChars)}\n...[truncated]`;
 }
 
-async function collectGitContext(pi: ExtensionAPI, ctx: ExtensionContext): Promise<GitContext> {
+async function collectGitContext(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<GitContext> {
 	const [statusShort, unstagedStat, stagedStat, unstagedDiff, stagedDiff] = await Promise.all([
-		gitStdout(pi, ctx, ["status", "--short"], 5000),
-		gitStdout(pi, ctx, ["diff", "--stat"], 10000),
-		gitStdout(pi, ctx, ["diff", "--cached", "--stat"], 10000),
-		gitStdout(pi, ctx, ["diff", "--no-ext-diff", "--no-color"], 15000),
-		gitStdout(pi, ctx, ["diff", "--cached", "--no-ext-diff", "--no-color"], 15000),
+		gitStdout(pi, ctx, ["status", "--short"], 5000, signal),
+		gitStdout(pi, ctx, ["diff", "--stat"], 10000, signal),
+		gitStdout(pi, ctx, ["diff", "--cached", "--stat"], 10000, signal),
+		gitStdout(pi, ctx, ["diff", "--no-ext-diff", "--no-color"], 15000, signal),
+		gitStdout(pi, ctx, ["diff", "--cached", "--no-ext-diff", "--no-color"], 15000, signal),
 	]);
 
 	return { statusShort, unstagedStat, stagedStat, unstagedDiff, stagedDiff };
@@ -256,9 +279,21 @@ function extractText(message: AssistantMessage): string {
 		.trim();
 }
 
+function jsonCandidate(text: string): string {
+	let candidate = text.trim();
+	const fenced = candidate.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+	if (fenced) candidate = fenced[1].trim();
+
+	if (candidate.startsWith("{") && candidate.endsWith("}")) return candidate;
+
+	const start = candidate.indexOf("{");
+	const end = candidate.lastIndexOf("}");
+	return start >= 0 && end > start ? candidate.slice(start, end + 1) : candidate;
+}
+
 function parseCommitMessageJson(text: string): CommitMessage | undefined {
 	try {
-		const data = JSON.parse(text) as unknown;
+		const data = JSON.parse(jsonCandidate(text)) as unknown;
 		if (!isRecord(data)) return undefined;
 		if (typeof data.subject !== "string" || data.subject.trim() === "") return undefined;
 		if (data.body !== undefined && typeof data.body !== "string") return undefined;
@@ -343,6 +378,7 @@ async function callCommitMessageModel(
 	selection: SelectedCommitModel,
 	systemPrompt: string,
 	userText: string,
+	signal?: AbortSignal,
 ): Promise<string> {
 	const userMessage: UserMessage = {
 		role: "user",
@@ -356,8 +392,9 @@ async function callCommitMessageModel(
 		{
 			apiKey: selection.apiKey,
 			headers: selection.headers,
-			signal: ctx.signal,
+			signal: signal ?? ctx.signal,
 			reasoning: selection.reasoning,
+			maxTokens: 1000,
 		},
 	);
 
@@ -375,10 +412,11 @@ async function generateCommitMessage(
 	gitContext: GitContext,
 	changeSummary: string,
 	changeReason?: string,
+	signal?: AbortSignal,
 ): Promise<CommitMessage> {
 	const selection = await selectCommitModel(pi, ctx, config);
 	const prompt = buildCommitMessagePrompt(config, gitContext, changeSummary, changeReason);
-	const initialOutput = await callCommitMessageModel(ctx, selection, prompt, "Generate the commit message JSON now.");
+	const initialOutput = await callCommitMessageModel(ctx, selection, prompt, "Generate the commit message JSON now.", signal);
 	const initialMessage = parseCommitMessageJson(initialOutput);
 	if (initialMessage) return initialMessage;
 
@@ -387,11 +425,24 @@ async function generateCommitMessage(
 		selection,
 		"Convert the user's previous output into strict JSON with only string keys subject and body. Return JSON only.",
 		initialOutput,
+		signal,
 	);
 	const repairedMessage = parseCommitMessageJson(repairOutput);
 	if (repairedMessage) return repairedMessage;
 
 	throw new Error("Commit message model output was invalid after one repair attempt.");
+}
+
+function latestAssistantToolCallCount(ctx: ExtensionContext): number {
+	const branch = ctx.sessionManager.getBranch();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (!("role" in message) || message.role !== "assistant") continue;
+		return message.content.filter((block) => block.type === "toolCall").length;
+	}
+	return 0;
 }
 
 async function commitCheckpoint(
@@ -400,15 +451,16 @@ async function commitCheckpoint(
 	config: AutoCommitConfig,
 	changeSummary: string,
 	changeReason?: string,
+	signal?: AbortSignal,
 ) {
-	if (!(await isInsideGitRepo(pi, ctx))) throw new Error("Not inside a git repository.");
+	if (!(await isInsideGitRepo(pi, ctx, signal))) throw new Error("Not inside a git repository.");
 
-	const inProgress = await getInProgressGitState(pi, ctx);
+	const inProgress = await getInProgressGitState(pi, ctx, signal);
 	if (inProgress.length > 0) {
 		throw new Error(`Git operation in progress (${inProgress.join(", ")}). Finish or abort it before checkpointing.`);
 	}
 
-	const status = await getPorcelainStatus(pi, ctx);
+	const status = await getPorcelainStatus(pi, ctx, signal);
 	if (status.length === 0) {
 		return {
 			content: [{ type: "text" as const, text: "No git-visible changes to commit." }],
@@ -416,21 +468,21 @@ async function commitCheckpoint(
 		};
 	}
 
-	const gitContext = await collectGitContext(pi, ctx);
-	const message = await generateCommitMessage(pi, ctx, config, gitContext, changeSummary, changeReason);
+	const gitContext = await collectGitContext(pi, ctx, signal);
+	const message = await generateCommitMessage(pi, ctx, config, gitContext, changeSummary, changeReason, signal);
 
-	await gitStdout(pi, ctx, ["add", "-A"]);
+	await gitStdout(pi, ctx, ["add", "-A"], undefined, signal);
 
-	const diffCheck = await execGit(pi, ctx, ["diff", "--cached", "--check"], 15000);
+	const diffCheck = await execGit(pi, ctx, ["diff", "--cached", "--check"], 15000, signal);
 	if (diffCheck.code !== 0) throw gitFailure("git diff --cached --check", diffCheck);
 
 	const commitArgs = ["commit", "-m", message.subject];
 	if (message.body) commitArgs.push("-m", message.body);
 
-	const commit = await execGit(pi, ctx, commitArgs, 30000);
+	const commit = await execGit(pi, ctx, commitArgs, 30000, signal);
 	if (commit.code !== 0) throw gitFailure("git commit", commit);
 
-	const hash = (await gitStdout(pi, ctx, ["rev-parse", "--short", "HEAD"], 5000)).trim();
+	const hash = (await gitStdout(pi, ctx, ["rev-parse", "--short", "HEAD"], 5000, signal)).trim();
 	return {
 		content: [{ type: "text" as const, text: `${hash} ${message.subject}` }],
 		details: { committed: true, hash, subject: message.subject },
@@ -479,15 +531,26 @@ export default function piAutoCommit(pi: ExtensionAPI) {
 			change_summary: Type.String({ description: "What changed, in plain language." }),
 			change_reason: Type.Optional(Type.String({ description: "Why it changed or important design context." })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (!enabled) {
 				throw new Error(
 					"Auto-commit is disabled. This tool cannot commit.\nIf the user explicitly asked for a commit, use the normal git workflow instead.",
 				);
 			}
 
-			return commitCheckpoint(pi, ctx, config, params.change_summary, params.change_reason);
+			return commitCheckpoint(pi, ctx, config, params.change_summary, params.change_reason, signal);
 		},
+	});
+
+	pi.on("tool_call", (event, ctx) => {
+		if (event.toolName !== "auto_commit_checkpoint") return;
+		if (latestAssistantToolCallCount(ctx) <= 1) return;
+
+		return {
+			block: true,
+			reason:
+				"auto_commit_checkpoint must be the only tool call in its assistant turn. Finish other tool calls first, then call it in the next turn.",
+		};
 	});
 
 	pi.on("session_start", async (_event, ctx) => {

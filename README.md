@@ -87,6 +87,8 @@ auto_commit_checkpoint({
 
 The inputs describe intent in plain language. The extension generates the actual git commit message from those inputs plus bounded git status, stats, and diff excerpts.
 
+Because Pi can run sibling tool calls in parallel, `auto_commit_checkpoint` must be the only tool call in its assistant turn. If the agent combines it with other tools, the extension blocks the checkpoint and the agent should retry after those tools finish.
+
 Commit-message generation hard-errors without staging or committing if the configured model is invalid, auth is unavailable, or the model output cannot be repaired into the required JSON shape. There is no fallback commit message in v1.
 
 ## Validation
@@ -103,6 +105,7 @@ Manual validation matrix:
 - Not in a git repo: startup with `defaultEnabled: true` and manual `/autocommit` emit errors and stay disabled.
 - Clean git repo: `/autocommit` enables, status shows `autocommit`, and the next agent turn receives the enabled policy.
 - Dirty git-visible repo: `/autocommit` rejects enablement; `defaultEnabled: true` startup warns and stays disabled.
+- Merge/rebase/cherry-pick/revert states reject enablement and checkpointing until finished or aborted.
 - Ignored files do not block enablement and are not committed.
 - Disabled `auto_commit_checkpoint` returns the generic git-workflow error without mentioning local skills or subagents.
 - Successful checkpoint commits all git-visible changes, including staged, unstaged, untracked, and deleted files, and returns hash plus subject.

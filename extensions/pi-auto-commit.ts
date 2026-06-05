@@ -1,5 +1,5 @@
-import { access, open, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { access, lstat, open, readFile } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 
 import { completeSimple, type Api, type AssistantMessage, type Model, type UserMessage } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExecResult, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -47,16 +47,19 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as 
 type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 type ReasoningLevel = Exclude<ThinkingLevel, "off">;
 
-type CommitModelConfig = {
-	provider: string;
-	model: string;
-	thinking: ThinkingLevel;
-};
+type CommitModelSetting =
+	| { kind: "current" }
+	| {
+			kind: "configured";
+			provider: string;
+			model: string;
+			thinking: ThinkingLevel;
+		}
+	| { kind: "invalid"; error: string };
 
 type AutoCommitConfig = {
 	defaultEnabled: boolean;
-	commitModel?: CommitModelConfig;
-	commitModelError?: string;
+	commitModel: CommitModelSetting;
 	messageInstructions: string[];
 };
 
@@ -105,29 +108,28 @@ function normalizeInstructions(value: unknown): string[] {
 	return instructions.length > 0 ? instructions : DEFAULT_MESSAGE_INSTRUCTIONS;
 }
 
-function parseCommitModel(value: unknown): Pick<AutoCommitConfig, "commitModel" | "commitModelError"> {
-	if (value === undefined) return {};
-	if (!isRecord(value)) return { commitModelError: "Invalid commitModel config: expected an object." };
+function parseCommitModel(value: unknown): CommitModelSetting {
+	if (value === undefined) return { kind: "current" };
+	if (!isRecord(value)) return { kind: "invalid", error: "Invalid commitModel config: expected an object." };
 
 	if (typeof value.provider !== "string" || value.provider.trim() === "") {
-		return { commitModelError: "Invalid commitModel config: provider is required." };
+		return { kind: "invalid", error: "Invalid commitModel config: provider is required." };
 	}
 	if (typeof value.model !== "string" || value.model.trim() === "") {
-		return { commitModelError: "Invalid commitModel config: model is required." };
+		return { kind: "invalid", error: "Invalid commitModel config: model is required." };
 	}
 	if (!isThinkingLevel(value.thinking)) {
 		return {
-			commitModelError:
-				"Invalid commitModel config: thinking must be off, minimal, low, medium, high, or xhigh.",
+			kind: "invalid",
+			error: "Invalid commitModel config: thinking must be off, minimal, low, medium, high, or xhigh.",
 		};
 	}
 
 	return {
-		commitModel: {
-			provider: value.provider.trim(),
-			model: value.model.trim(),
-			thinking: value.thinking,
-		},
+		kind: "configured",
+		provider: value.provider.trim(),
+		model: value.model.trim(),
+		thinking: value.thinking,
 	};
 }
 
@@ -135,7 +137,7 @@ function parseConfig(raw: unknown): AutoCommitConfig {
 	const data = isRecord(raw) ? raw : {};
 	return {
 		defaultEnabled: data.defaultEnabled === true,
-		...parseCommitModel(data.commitModel),
+		commitModel: parseCommitModel(data.commitModel),
 		messageInstructions: normalizeInstructions(data.messageInstructions),
 	};
 }
@@ -267,6 +269,17 @@ function clip(text: string, maxChars = 12000): string {
 	return `${text.slice(0, maxChars)}\n...[truncated]`;
 }
 
+function isSensitiveUntrackedName(path: string): boolean {
+	const name = basename(path).toLowerCase();
+	return (
+		name.startsWith(".env") ||
+		name.endsWith(".pem") ||
+		name === "id_rsa" ||
+		name === "id_ed25519" ||
+		name === "credentials.json"
+	);
+}
+
 async function readUntrackedExcerpt(path: string, maxBytes: number): Promise<string> {
 	const file = await open(path, "r");
 	try {
@@ -294,8 +307,20 @@ async function collectUntrackedFiles(pi: ExtensionAPI, ctx: ExtensionContext, si
 	for (const relativePath of paths.slice(0, MAX_UNTRACKED_FILES)) {
 		if (remainingBytes <= 0) break;
 
+		if (isSensitiveUntrackedName(relativePath)) {
+			excerpts.push(`# ${relativePath}\n[sensitive-looking file skipped]`);
+			continue;
+		}
+
 		try {
-			const excerpt = await readUntrackedExcerpt(resolve(repoRoot, relativePath), Math.min(MAX_UNTRACKED_FILE_BYTES, remainingBytes));
+			const path = resolve(repoRoot, relativePath);
+			const stat = await lstat(path);
+			if (stat.isSymbolicLink()) {
+				excerpts.push(`# ${relativePath}\n[symlink skipped]`);
+				continue;
+			}
+
+			const excerpt = await readUntrackedExcerpt(path, Math.min(MAX_UNTRACKED_FILE_BYTES, remainingBytes));
 			remainingBytes -= excerpt.length;
 			excerpts.push(`# ${relativePath}\n${excerpt}`);
 		} catch (error) {
@@ -401,14 +426,24 @@ async function selectCommitModel(
 	ctx: ExtensionContext,
 	config: AutoCommitConfig,
 ): Promise<SelectedCommitModel> {
-	if (config.commitModelError) throw new Error(config.commitModelError);
+	let model: Model<Api> | undefined;
+	let thinking = pi.getThinkingLevel();
 
-	const model = config.commitModel
-		? ctx.modelRegistry.find(config.commitModel.provider, config.commitModel.model)
-		: ctx.model;
+	switch (config.commitModel.kind) {
+		case "current":
+			model = ctx.model;
+			break;
+		case "configured":
+			model = ctx.modelRegistry.find(config.commitModel.provider, config.commitModel.model);
+			thinking = config.commitModel.thinking;
+			break;
+		case "invalid":
+			throw new Error(config.commitModel.error);
+	}
+
 	if (!model) {
 		throw new Error(
-			config.commitModel
+			config.commitModel.kind === "configured"
 				? `Commit model not found: ${config.commitModel.provider}/${config.commitModel.model}`
 				: "No active model selected for commit-message generation.",
 		);
@@ -420,7 +455,6 @@ async function selectCommitModel(
 		throw new Error(`No API key or auth headers for ${model.provider}`);
 	}
 
-	const thinking = config.commitModel?.thinking ?? pi.getThinkingLevel();
 	return {
 		model,
 		apiKey: auth.apiKey,

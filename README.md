@@ -74,6 +74,8 @@ While auto-commit is enabled, anything git-visible may be committed, including m
 
 Checkpoint commits use `git add -A` semantics: staged changes, unstaged changes, untracked non-ignored files, and deletions are included. The extension never pushes.
 
+For commit-message generation, untracked symlink contents are not read, and untracked files with obvious sensitive-looking names such as `.env*`, `*.pem`, `id_rsa`, `id_ed25519`, and `credentials.json` are omitted from model excerpts. This is prompt hygiene only: git-visible files with those names are still staged and committed unless you ignore or move them.
+
 ## Agent tool
 
 When enabled, the agent may call:
@@ -85,7 +87,7 @@ auto_commit_checkpoint({
 })
 ```
 
-The inputs describe intent in plain language. The extension generates the actual git commit message from those inputs plus bounded git status, stats, diff excerpts, and untracked-file excerpts.
+The inputs describe intent in plain language. The extension generates the actual git commit message from those inputs plus bounded git status, stats, diff excerpts, and untracked-file excerpts. Untracked symlinks and obvious sensitive-looking untracked files are represented with skip markers instead of file contents.
 
 Because Pi can run sibling tool calls in parallel, `auto_commit_checkpoint` must be the only tool call in its assistant turn. If the agent combines it with other tools, the extension blocks the checkpoint and the agent should retry after those tools finish.
 

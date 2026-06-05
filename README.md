@@ -94,8 +94,14 @@ Commit-message generation hard-errors without staging or committing if the confi
 Quick manual checks:
 
 - Load locally with `pi -e .`.
-- In a clean git repo, `/autocommit` enables and shows `autocommit`.
-- In a dirty git-visible repo, `/autocommit` rejects enablement.
+- Not in a git repo: startup and `/autocommit` fail clearly.
+- Clean git repo: `/autocommit` enables and shows `autocommit`.
+- Dirty git-visible repo: `/autocommit` rejects enablement.
+- Ignored files do not block enablement.
 - With `defaultEnabled: true`, startup tries to enable and warns if it cannot.
-- Call `auto_commit_checkpoint` while disabled to confirm the generic error.
-- Trigger a checkpoint on a clean repo to confirm it reports a compact success result.
+- Disabled `auto_commit_checkpoint` returns the generic git-workflow error.
+- Successful checkpoint commits staged, unstaged, untracked, and deleted git-visible changes.
+- No git-visible changes returns a compact no-op.
+- Invalid/unavailable commit model hard-errors with no staging.
+- Malformed model output gets one repair attempt, then hard-errors if still invalid.
+- `git diff --cached --check` / hook failures surface and auto-commit stays enabled.

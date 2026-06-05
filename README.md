@@ -88,3 +88,14 @@ auto_commit_checkpoint({
 The inputs describe intent in plain language. The extension generates the actual git commit message from those inputs plus bounded git status, stats, and diff excerpts.
 
 Commit-message generation hard-errors without staging or committing if the configured model is invalid, auth is unavailable, or the model output cannot be repaired into the required JSON shape. There is no fallback commit message in v1.
+
+## Validation
+
+Quick manual checks:
+
+- Load locally with `pi -e .`.
+- In a clean git repo, `/autocommit` enables and shows `autocommit`.
+- In a dirty git-visible repo, `/autocommit` rejects enablement.
+- With `defaultEnabled: true`, startup tries to enable and warns if it cannot.
+- Call `auto_commit_checkpoint` while disabled to confirm the generic error.
+- Trigger a checkpoint on a clean repo to confirm it reports a compact success result.

@@ -169,7 +169,7 @@ async function generateCommitMessage(pi: ExtensionAPI, ctx: ExtensionContext, co
 	const response = await completeSimple(model as Model, {
 		systemPrompt: prompt,
 		messages: [{ role: "user", content: [{ type: "text", text: "Generate the commit message now." }], timestamp: Date.now() } satisfies UserMessage],
-	}, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal });
+	}, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal, reasoning });
 
 	let message = parseJsonCommit(extractText(response));
 	if (message.subject && message.subject.length > 0) return message;
@@ -180,7 +180,7 @@ async function repairCommitMessage(pi: ExtensionAPI, ctx: ExtensionContext, mode
 	const repair = await completeSimple(model, {
 		systemPrompt: "Convert the previous output into strict JSON with keys subject and optional body only.",
 		messages: [{ role: "user", content: [{ type: "text", text: previous }], timestamp: Date.now() } satisfies UserMessage],
-	}, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal });
+	}, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal, reasoning });
 	return parseJsonCommit(extractText(repair));
 }
 
@@ -204,6 +204,7 @@ async function getCommitMessage(pi: ExtensionAPI, ctx: ExtensionContext, config:
 async function checkpoint(pi: ExtensionAPI, ctx: ExtensionContext, config: AutoCommitConfig, changeSummary: string, changeReason?: string) {
 	if (!enabledState.enabled) throw new Error("Auto-commit is disabled. This tool cannot commit. If the user explicitly asked for a commit, use the normal git workflow instead.");
 	if (!(await isInsideGitRepo(pi, ctx))) throw new Error("Not inside a git repository.");
+	if (await hasInProgressGitState(pi, ctx)) throw new Error("Git is mid-merge/rebase/cherry-pick. Finish or abort it first.");
 	const dirty = await getDirtyStatus(pi, ctx);
 	if (dirty === null) throw new Error("Could not inspect git status.");
 	if (dirty.length === 0) return { content: [{ type: "text", text: "No git-visible changes to commit." }] };
